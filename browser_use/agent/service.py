@@ -53,6 +53,7 @@ from browser_use.telemetry.feedback import RunReports
 from browser_use.telemetry.recorder import RunRecorder, now
 from browser_use.telemetry.stats import model_id
 from browser_use.tools import Tools
+from browser_use.trajectory import TrajectoryConfig, TrajectoryError
 from browser_use.utils import raise_fd_limit
 
 logger = logging.getLogger(__name__)
@@ -238,7 +239,12 @@ class Agent:
 	the agent's screenshots. False turns them off. judge: after each run one more request to the same llm judges it
 	against the task: result.judgement (success, failure_reason, description, prompt_injection_detected,
 	bot_block_or_captcha_detected, gotchas), its tokens and cost counted in result.usage and result.cost_usd; False turns
-	it off. judge_context: your criteria or the expected answer, which the judge puts first (0.x ground_truth)."""
+	it off. judge_context: your criteria or the expected answer, which the judge puts first (0.x ground_truth).
+	trajectory: None (default, the live loop is unchanged), a path/str recording this run's decisions, cells, selectors,
+	DOM snapshot digests and tool results to that JSONL file, or a TrajectoryConfig for replay. A replay re-serves the
+	recorded decisions and branches back to the live model on a changed page, stale selector, corrupt file or different
+	model family instead of running a wrong action; agent.replay_diff holds the divergence metrics. Recorded lines are
+	secret-redacted and image binaries are never stored; see MIGRATING.md "Trajectory recording and replay"."""
 
 	def __init__(
 		self,
@@ -260,6 +266,7 @@ class Agent:
 		highlight_actions: bool = True,
 		judge: bool = True,
 		judge_context: str | None = None,
+		trajectory: Any = None,
 		**kwargs: Any,
 	):
 		# 0.x use_judge and ground_truth: the same options under their old names
@@ -282,6 +289,11 @@ class Agent:
 			raise TypeError(f'judge must be True or False, not {judge!r}')
 		if judge_context is not None and not isinstance(judge_context, str):
 			raise TypeError(f'judge_context must be a str or None, not {type(judge_context).__name__}')
+		if trajectory is not None and not isinstance(trajectory, (str, Path, TrajectoryConfig)):
+			raise TypeError(
+				'trajectory must be a path (str/Path) recording to that file, a TrajectoryConfig, or None, '
+				f'not {type(trajectory).__name__}'
+			)
 		if max_context_chars is not None and (type(max_context_chars) is not int or max_context_chars < 1):
 			raise ValueError(f'max_context_chars must be a positive int or None, not {max_context_chars!r}')
 		if llm is None and os.environ.get('DEFAULT_LLM'):  # 0.x read it; 1.0 runs (and bills) bu-fast instead
@@ -326,6 +338,9 @@ class Agent:
 		self.extend_system_message, self.reasoning = extend_system_message or '', reasoning
 		self.web_search, self.max_context_chars, self.highlight_actions = web_search, max_context_chars, highlight_actions
 		self.judge, self.judge_context = judge, judge_context or None
+		# A bare path means "record here"; TrajectoryConfig selects replay and bounds. None (the default) changes nothing.
+		self.trajectory_config = TrajectoryConfig(trajectory) if isinstance(trajectory, (str, Path)) else trajectory
+		self._trajectory_diff: dict[str, Any] | None = None  # the last run's replay divergence metrics (replay modes)
 		self._judge_cost: float | None = None  # the last run's judge cost (telemetry)
 		self._final_page: BinaryContent | None = None  # the last run's final page, for the judge
 		self._search: WebSearch | None = None  # set by _build when search() is on
@@ -347,6 +362,14 @@ class Agent:
 		self._downloads: list[Path] = []  # what the last stop() copied from a cloud browser (telemetry counts them)
 		self._sync = False  # the current run came from run_sync()
 		self._reports = RunReports()  # report_issue() from the REPL, pointed at each run
+		self._override_token: Any = None  # a replay run's _override_model ContextVar token, reset after the run
+
+	@property
+	def replay_diff(self) -> dict[str, Any] | None:
+		"""The last run's replay divergence metrics (ReplayDiff.as_dict()) after a replay trajectory run; None otherwise.
+		Keys: replayed_steps, replayed_cells, live_steps, page_mismatches, selector_mismatches, result_mismatches,
+		model_mismatches, corrupt_lines, branched, branch_step, branch_reason, completed."""
+		return self._trajectory_diff
 
 	@property
 	def workspace(self) -> Path:
@@ -442,6 +465,79 @@ class Agent:
 		key = (gateway.api_key if gateway else None) or browser_use_api_key('Agent(web_search=True)')
 		return WebSearch(key, search_url(gateway.base_url if gateway else GATEWAY_URL))
 
+	def _start_trajectory(self, session: Session) -> Any:
+		"""Wire recording or replay into the run's Session. Returns the trajectory object (also on session), or None when
+		the feature is off. A replay that cannot load its trajectory degrades to a plain live run: a bad file never
+		executes a wrong action and never starts a crash the caller did not ask for."""
+		from browser_use import trajectory as traj_module
+
+		cfg = self.trajectory_config
+		if cfg is None:
+			return None
+		secrets = scoped_secrets(self.sensitive_data)
+		traj_module.seed_generators(cfg.seed)
+		if cfg.mode == 'record':
+			recorder = traj_module.build_recorder(cfg, task=self.task, model_name=self._model_ref, secrets=secrets)
+			session.trajectory = recorder
+			logger.info('Recording trajectory to %s', cfg.path)
+			return recorder
+		# replay / replay-branch: wrap the live model so recorded decisions are served until the first mismatch
+		try:
+			controller, make_model = traj_module.build_replay(cfg, model_name=self._model_ref, secrets=secrets)
+		except TrajectoryError as e:
+			logger.warning('Trajectory replay disabled (%s); running live without recording', e)
+			return None
+		live_model = self._model
+		# agent.override() is a block-scoped context manager; a run needs the swap to span run() itself, so set the same
+		# ContextVar (_override_model, an Option = Some(model) | None) directly. The token is reset in _finish_trajectory.
+		from pydantic_ai import _utils
+
+		self._override_token = self._agent._override_model.set(_utils.Some(make_model(live_model, controller)))
+		session.trajectory = controller
+		if cfg.mode == 'replay-branch':
+			branch = Path(cfg.branch_path) if cfg.branch_path else Path(cfg.path).with_suffix('.branch.jsonl')
+			controller.branch_path = branch
+		logger.info('Replaying trajectory %s (model %s)', cfg.path, self._model_ref)
+		return controller
+
+	def _finish_trajectory(self, trajectory: Any, session: Session) -> None:
+		"""Close recording, or freeze the replay diff onto the Agent for the caller. Never raises."""
+		from browser_use.trajectory import ReplayController, TrajectoryRecorder
+
+		if self._override_token is not None:  # the replay model swap ends with the run, even on a raised exception
+			self._agent._override_model.reset(self._override_token)
+			self._override_token = None
+		try:
+			if isinstance(trajectory, TrajectoryRecorder):
+				trajectory.finish('ended')
+			elif isinstance(trajectory, ReplayController):
+				trajectory.mark_completed()
+				self._trajectory_diff = trajectory.diff.as_dict()
+				logger.info(trajectory.diff.summary())
+				if trajectory.live and trajectory.branch_path is not None:
+					self._write_branch(trajectory, session)
+		except Exception as e:  # - trajectory bookkeeping must not change the run's result
+			logger.warning('Trajectory finalization failed: %s', e)
+
+	def _write_branch(self, controller: Any, session: Session) -> None:
+		"""replay-branch: persist the live decisions taken after the branch point as a child trajectory."""
+		from browser_use.trajectory import TrajectoryStore
+
+		secrets = scoped_secrets(self.sensitive_data)
+		store = TrajectoryStore(path=controller.branch_path, forms=secret_forms(secrets))
+		store.write_header(
+			task=self.task,
+			model_name=self._model_ref,
+			seed=self.trajectory_config.seed if self.trajectory_config else None,
+			secret_names=[n for n, _, _ in secrets],
+		)
+		store.mark_branch(controller.diff.branch_step or 0, controller.diff.branch_reason or 'live')
+		# The branched run's live responses are already in the transcript; mirror the post-branch ones into the child.
+		for i, message in enumerate(session.messages):
+			if isinstance(message, ModelResponse):
+				store.record_response(i, message)
+		store.mark_finish('branch')
+
 	async def run(self, max_steps: int = 100, timeout: float = 1700, **kwargs: Any) -> AgentHistoryList:
 		"""Run the current task. max_steps: model requests; as in 0.x the last one is a delivery-only turn (max_steps=1
 		only delivers), and one delivery repair may follow it. timeout: seconds for the agent loop (model requests and
@@ -471,6 +567,7 @@ class Agent:
 		if self._agent is None:
 			self._build()
 		started, result, error_type, session, browser_s = time.monotonic(), None, None, None, None
+		self._trajectory_diff = None
 		tools = frozenset(t.name for t in self.tools.functions) if self.tools else frozenset()
 		rec = RunRecorder(tools, self._model_name, bool(self._gateway))
 		run_id, number, concurrent, phase = uuid.uuid4().hex, next(_RUNS), _ACTIVE[0], 'preflight'
@@ -536,15 +633,19 @@ class Agent:
 				repl=self._repl, timeout_s=timeout, max_steps=max_steps, vision=self.use_vision, rec=rec, **compacted
 			)
 			self._reports.stats = session.stats
+			trajectory = self._start_trajectory(session)
 			phase = 'loop'
-			result = await run(
-				self._agent,
-				self.task,
-				session,
-				self._model_ref,
-				message_history=history,
-				explain_error=self._gateway.explain_error if self._gateway else None,
-			)
+			try:
+				result = await run(
+					self._agent,
+					self.task,
+					session,
+					self._model_ref,
+					message_history=history,
+					explain_error=self._gateway.explain_error if self._gateway else None,
+				)
+			finally:
+				self._finish_trajectory(trajectory, session)
 			self._history = session.messages  # raw: result.messages has secrets redacted
 			# the judge sees the page as the run left it, before the browser stops
 			judged = self.judge and self.use_vision and result.steps

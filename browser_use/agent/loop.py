@@ -146,6 +146,7 @@ class Session:
 	provider_retried: bool = False  # BrowserLoop: bu-pi's one provider retry per run is used
 	summaries: list[ModelResponse] = field(default_factory=list)  # summarizer responses, counted in usage and cost
 	rec: RunRecorder = field(default_factory=RunRecorder)  # telemetry, step by step
+	trajectory: Any = None  # browser_use.trajectory: TrajectoryRecorder | ReplayController | None (None = live, unchanged)
 
 	def delivery_at(self) -> float:
 		"""Seconds into the run at which the delivery-only turn starts: 90% of the budget, or earlier on a short budget
@@ -165,8 +166,57 @@ class Session:
 		return redact(value, self.repl.secrets)
 
 
+async def _page_snapshot(repl: Repl) -> dict[str, Any]:
+	"""A bounded DOM snapshot summary for the trajectory: one js() round trip evaluating a self-contained JS probe.
+	Never a full DOM rebuild; a probe failure degrades to page_info alone, and a dead browser to {}."""
+	from browser_use.trajectory import _SNAPSHOT_JS
+
+	try:
+		# The probe is JavaScript source, handed to js() as a string (never embedded in a Python expression, which
+		# Python would try to parse); json.dumps gives a safely quoted single-line JS string literal.
+		cell = 'print(__import__("json").dumps(js(' + json.dumps(_SNAPSHOT_JS.strip()) + ')))'
+		r = await repl.call('exec', cell, 30)
+		if r.get('error'):
+			r = await repl.call('exec', 'print(__import__("json").dumps(page_info()))', 30)
+		payload = (r.get('output') or '').strip().splitlines()[-1] if r.get('output') else ''
+		return json.loads(payload) if payload.startswith('{') else {}
+	except Exception:  # - a trajectory probe must never break the run
+		return {}
+
+
+async def _selectors_resolve(repl: Repl, selectors: list[str]) -> dict[str, bool | None]:
+	"""Whether each recorded selector still resolves on the live page, in one js() round trip. A probe error resolves
+	to None per selector ('unknown'), which is never treated as stale: only a confirmed False blocks replay."""
+	if not selectors:
+		return {}
+	probe = (
+		'import json as _json\n'
+		'__bu_selector_probe = True\n'
+		f'_sel = {selectors!r}\n'
+		'_out = {}\n'
+		'for _s in _sel:\n'
+		'    if _s.startswith("/"):\n'
+		'        _out[_s] = True  # XPath: probe it with the page-level document.evaluate instead\n'
+		'        continue\n'
+		'    try:\n'
+		'        # resolve inside page JS: a DOM element serializes to {} across the js() bridge, so the null check\n'
+		'        # must happen before the value leaves the page\n'
+		'        _out[_s] = bool(js("document.querySelector(" + _json.dumps(_s) + ") !== null"))\n'
+		'    except Exception:\n'
+		'        _out[_s] = None\n'
+		'print(_json.dumps(_out))'
+	)
+	try:
+		r = await repl.call('exec', probe, 30)
+		payload = (r.get('output') or '').strip().splitlines()[-1] if r.get('output') else ''
+		out = json.loads(payload) if payload.startswith('{') else {}
+		return {s: bool(out[s]) if s in out and out[s] is not None else None for s in selectors}
+	except Exception:  # - unknown, not stale: do not branch on a failed probe
+		return {s: None for s in selectors}
+
+
 async def python(ctx: RunContext[Session], code: str) -> list[Any]:
-	"""Run Python in the persistent REPL (browser-harness helpers and raw cdp() pre-imported).
+	"""Run Python in the persistent REPL (browser-harness helpers and raw CDP() pre-imported).
 
 	Browser helpers are synchronous (do not await them); variables survive calls; the last expression is printed. Cell deadline
 	applies; checkpoint small batches before it. screenshot() returns native images.
@@ -176,6 +226,26 @@ async def python(ctx: RunContext[Session], code: str) -> list[Any]:
 	left = ctx.deps.delivery_at() - (started - ctx.deps.started)  # a cell never runs into the delivery turn's time
 	if left <= 0:  # a later call of the same response, after an earlier one used the time up
 		return [NO_TIME]
+	traj = ctx.deps.trajectory
+	from browser_use.trajectory import ReplayController, TrajectoryRecorder, extract_selectors
+
+	selectors = extract_selectors(code)
+	before = await _page_snapshot(repl) if traj is not None else {}
+	if isinstance(traj, ReplayController) and not traj.live:
+		# Replay: validate the page BEFORE the recorded cell can touch it. On any mismatch the cell is withheld (never
+		# executed on a wrong page), the controller branches to live mode, and a ModelRetry hands this turn to the real
+		# model: the next request goes through ReplayModel, which now delegates to the live model.
+		resolved = await _selectors_resolve(repl, selectors)
+		ok = traj.observe_cell(step=ctx.run_step, code=code, before=before, selectors_resolved=resolved)
+		if not ok:
+			ctx.deps.rec.retry('trajectory_branch')
+			raise ModelRetry(
+				f'Trajectory replay stopped before this action ({traj.diff.branch_reason}). The recorded action was not '
+				'executed. Inspect the current page and decide the next live action yourself.'
+			)
+	recorder = traj if isinstance(traj, TrajectoryRecorder) else None
+	if recorder is not None:
+		recorder.before_cell(code, before, selectors)
 	ctx.deps.rec.cell_start()
 	starts = getattr(repl, 'start_ns', 0)  # test doubles have none
 	# Ultrafast prints the page state after the cell's code, so its cells get 10 s more (Pi src/runtime.ts:257), out of
@@ -187,6 +257,20 @@ async def python(ctx: RunContext[Session], code: str) -> list[Any]:
 	ctx.deps.rec.cell(r, code, now() - t0, ctx.deps.vision)
 	if r.get('browser_gone'):  # a model left without a browser went looking for another one (the user's own Chrome)
 		ctx.deps.budget_hit = 'browser_gone'
+	if recorder is not None or isinstance(traj, ReplayController):
+		after = await _page_snapshot(repl)
+		compact = {
+			'error_type': r.get('error_type'),
+			'error': r.get('error'),
+			'output': r.get('output'),
+			'images': r.get('images', []),
+		}
+		if recorder is not None:
+			recorder.after_cell(after, compact)
+		elif isinstance(traj, ReplayController) and not traj.live:
+			# A post-action divergence ends replay after the fact: the recorded cell already ran on a matching pre-page,
+			# so the next request (not this cell) is the first fully live one.
+			traj.observe_result(code, compact, after)
 	text = r['output']  # already cut to MAX_OUTPUT_CHARS by the worker
 	if r['error']:
 		text = f'{text}\nError: {r["error"]}'.strip()
@@ -540,6 +624,12 @@ class Recording(AbstractCapability[Session]):
 		self, ctx: RunContext[Session], *, request_context: ModelRequestContext, response: ModelResponse
 	):
 		ctx.deps.rec.attempt_ok(response, ctx.deps.finalizing)
+		traj = ctx.deps.trajectory
+		if traj is not None:
+			from browser_use.trajectory import TrajectoryRecorder
+
+			if isinstance(traj, TrajectoryRecorder):  # live run: persist the decision the model just made
+				traj.record_response(ctx.run_step, response)
 		return response
 
 	async def on_model_request_error(self, ctx: RunContext[Session], *, request_context: ModelRequestContext, error: Exception):

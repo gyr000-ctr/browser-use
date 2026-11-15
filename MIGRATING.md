@@ -295,6 +295,22 @@ instrumentation is on: `pydantic_ai.Agent.instrument_all()` sends them to the gl
 (Laminar, Langfuse, Datadog and others accept OTLP), and `logfire.instrument_pydantic_ai()` sends them to Logfire.
 Spans carry prompts and cell output; pass `InstrumentationSettings(include_content=False)` to leave those out.
 
+#### Trajectory recording and replay
+
+`Agent(trajectory=...)` records a run to a JSONL file and can replay a recorded run later. It is opt-in: without it the
+live loop is unchanged. A path (`Agent(trajectory='run.jsonl')`) records; pass `TrajectoryConfig(path, mode='replay')`
+to replay and `mode='replay-branch'` to also write the post-branch decisions into a child trajectory. During replay the
+recorded model decisions are served back in order, and before each Python cell the current page is checked against the
+recorded DOM snapshot digest and the recorded selectors. On any mismatch — a changed page, a selector that no longer
+resolves, a corrupted/truncated trajectory, or a different model family — the recorded action is *not* executed: the run
+branches back to the live model instead, and `agent.replay_diff` reports the divergence (`replayed_steps`,
+`replayed_cells`, `live_steps`, `page_mismatches`, `selector_mismatches`, `result_mismatches`, `branched`,
+`branch_step`, `branch_reason`, `corrupt_lines`, `completed`). The store is bounded (`max_steps`, `max_bytes`; the
+header and newest steps survive trimming), every serialized line passes the same secret redaction as the rest of the
+run so no password or token is ever written, image binaries are never stored, and each step uses one bounded page
+probe rather than rebuilding the whole page. `seed` seeds the in-process random generators for reproducibility; model
+sampling itself is provider-side, which is why replay reuses the recorded decisions instead of re-rolling the model.
+
 ## CLI and MCP
 
 The `browser-use` CLI (Python piped to browser-harness), `browser-use skill install` and `browser-use --cli-mcp` work
@@ -370,6 +386,9 @@ longer word or number; `Agent` warns about such values):
   the task text, typed text, code or secrets. `ANONYMIZED_TELEMETRY=false` turns it off
 - `result.messages`: the model's text, thinking and tool-call arguments, and the retry messages that quote them back (a follow-up task continues the unredacted
   transcript, since providers reject edited signed thinking; screenshots in it stay unredacted)
+- trajectory files written by `Agent(trajectory=...)`: each JSONL line (recorded decisions, cell code, selectors,
+  snapshots, tool results and any branched child trajectory) is passed through the same redaction before it reaches
+  disk, so a secret value appears only as `<secret:name>`; screenshot/image binaries are never stored in the file
 
 Nothing else is redacted. This is not a sandbox:
 
