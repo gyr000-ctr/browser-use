@@ -17,6 +17,7 @@ Agent(task, llm, browser).run()                  browser_use/agent/service.py   
                                                                                 image pruning, delivery guards, budgets, partial results
        python(code) -> Repl.call()               browser_use/repl/session.py    parent side: spawns the worker, allowlisted env, redaction
                     -> worker process            browser_use/repl/worker.py     runs cells; helpers, screenshot, checkpoint, type_secret
+                       (multi-tab orchestration  browser_use/repl/tabs.py      bounded tab/popup registry, open_tab/switch_to_tab/await_popup)
                        mode='ultrafast' adds bu  browser_use/ax.py              accessibility-tree helpers (port of Browser Use Pi ax.ts)
   <- AgentHistoryList                            browser_use/agent/views.py     status, text/output, success, partial, usage, cost_usd, messages
 ```

@@ -1,7 +1,9 @@
 """Persistent Python REPL for one agent. Runs as a child process so a hung cell can be killed.
 
 Namespace = browser-harness helpers + screenshot/show_image/checkpoint/type_secret/solve_captcha/report_issue (+ bu in
-ultrafast mode, see ax.py; + search when web search is on; + downloads for a cloud browser or a Chrome the Browser launched).
+ultrafast mode, see ax.py; + search when web search is on; + downloads for a cloud browser or a Chrome the Browser launched;
++ open_tab/switch_to_tab/await_popup/popups/tabs/close_extra_tabs/tab_stats for multi-tab/popup orchestration, see
+repl/tabs.py).
 Protocol: connect to 127.0.0.1:BU_REPL_PORT, send BU_REPL_TOKEN, read one init line ({"secrets": [[name, value, domain|null], ...],
 "search": bool, "downloads": bool}), then one JSON line per message. search(), downloads() and report_issue() send
 {"type": "search" | "downloads" | "feedback", "args": {...}} mid-cell and read the parent's one-line answer. Cell stdout/stderr (including subprocesses) go to a per-cell file, so a killed cell still leaves its
@@ -55,6 +57,7 @@ from browser_use.repl.session import (
 	redact_forms,
 	secret_forms,
 )
+from browser_use.repl.tabs import MAX_POPUPS_PER_PAGE, MAX_POPUPS_TOTAL, MAX_TABS, TabManager
 from browser_use.telemetry.stats import MAX_TYPED, MAX_URLS, error_class, host, page_url, raised_by_cell
 from browser_use.utils import TLSHandler, install_tls_opener, name_download
 
@@ -491,7 +494,15 @@ EDITABLE = """function () {
 }"""
 
 
-def _install(ns: dict, secrets: list) -> tuple[ax.AxHelpers | None, Captcha]:
+def _int_env(name: str, default: int) -> int:
+	"""A positive int from the environment (BU_MAX_TABS and friends); anything else is the default."""
+	try:
+		return int(os.environ.get(name, '') or default)
+	except ValueError:
+		return default
+
+
+def _install(ns: dict, secrets: list) -> tuple[ax.AxHelpers | None, Captcha, TabManager]:
 	env = dict(os.environ)  # the allowlisted env the parent gave us
 	from browser_harness import helpers  # loads .env files and agent_helpers.py into this process
 
@@ -499,6 +510,18 @@ def _install(ns: dict, secrets: list) -> tuple[ax.AxHelpers | None, Captcha]:
 	os.environ.update(env)
 
 	raw_send = helpers._send
+	# The bounded tab/popup registry (repl/tabs.py): created before send() so drained Target.* events reach it from the
+	# first request on; bound to cdp/helpers once those exist. Own browser: every discovered tab is the agent's; on the
+	# user's Chrome (Browser('chrome')) tabs without an opener are the user's and cleanup() never closes them.
+	own_browser = os.environ.get('BU_OWN_BROWSER') == '1' or os.environ.get('BU_REMOTE_BROWSER') == '1'
+	tabman = TabManager(
+		own_browser=own_browser,
+		on_event=lambda name: stats.count('events', name),
+		max_tabs=_int_env('BU_MAX_TABS', MAX_TABS),
+		max_popups_per_page=_int_env('BU_MAX_POPUPS_PER_PAGE', MAX_POPUPS_PER_PAGE),
+		max_popups_total=_int_env('BU_MAX_POPUPS_TOTAL', MAX_POPUPS_TOTAL),
+		log_path=STATE / 'tabs.jsonl',
+	)
 
 	def send(req, *args, **kwargs):  # every drain_events() read, also bu's background one, feeds the event counts
 		if (size := len(json.dumps(req))) > MAX_IPC_REQUEST:
@@ -522,6 +545,8 @@ def _install(ns: dict, secrets: list) -> tuple[ax.AxHelpers | None, Captcha]:
 			unmark()
 		if isinstance(req, dict) and req.get('meta') == 'drain_events' and isinstance(r, dict):
 			stats.observe(r.get('events'))
+			with contextlib.suppress(Exception):  # tab discovery never breaks a cell's drain
+				tabman.observe(r.get('events'))
 		return r
 
 	def unmark() -> None:
@@ -929,13 +954,36 @@ def _install(ns: dict, secrets: list) -> tuple[ax.AxHelpers | None, Captcha]:
 			print(*('' if isinstance(a, ax.Printed) else a for a in args), **kwargs)
 
 		ns['print'] = print_
+	# Multi-tab/popup orchestration (repl/tabs.py): bound once cdp and helpers (drain_events included) exist.
+	tabman.bind(cdp, helpers)
+	with contextlib.suppress(Exception):  # an older Chrome or daemon: discovery stays off, open_tab() still works
+		cdp('Target.setDiscoverTargets', discover=True)
+	with contextlib.suppress(Exception):  # no daemon yet: the registry fills from events as they come
+		tabman.seed()
+	ns.update(
+		open_tab=tabman.open,
+		switch_to_tab=tabman.switch,
+		await_popup=tabman.await_popup,
+		popups=tabman.popups,
+		tabs=tabman.listing,
+		close_extra_tabs=tabman.cleanup,
+		tab_stats=tabman.metrics,
+	)
 	# helpers and the ones above (solve_captcha, drain_events too); not stdlib names the * import brought
-	own = {helpers.__name__, __name__, ax.__name__, Captcha.__module__, uploader.__module__, wait_for_network_idle.__module__}
+	own = {
+		helpers.__name__,
+		__name__,
+		ax.__name__,
+		Captcha.__module__,
+		uploader.__module__,
+		wait_for_network_idle.__module__,
+		TabManager.__module__,
+	}
 	for name, value in list(ns.items()):
 		if name not in ('cdp', 'print') and not name.startswith('_') and inspect.isroutine(value):
 			if getattr(value, '__module__', None) in own:
 				ns[name] = _counted(name, value)
-	return bu, captcha
+	return bu, captcha, tabman
 
 
 def _ask_parent(rfile, wfile):
@@ -1152,7 +1200,7 @@ def main() -> None:
 	sys.stderr.reconfigure(encoding='utf-8', line_buffering=True)  # type: ignore[attr-defined]
 	_redact_between_cells(secrets)  # after reconfigure(): it seeks, which a pipe refuses
 	ns: dict = {'__name__': '__main__', '__bu_display': _display}
-	bu, captcha = _install(ns, secrets)
+	bu, captcha, tabman = _install(ns, secrets)
 	ask = _ask_parent(rfile, wfile)
 	if init.get('search'):
 		ns['search'] = _counted('search', _search(ask))
@@ -1213,6 +1261,8 @@ def main() -> None:
 				started, stats.started = stats.started, []
 			if started:  # 0.x told the model too; buried in drain_events() output, it clicked again ('x (1).csv')
 				print(f'[download started: {", ".join(started)}]')
+			for notice in tabman.take_notices():  # new tabs/popups, crashes, popup-limit closures since the last cell
+				print(notice)
 			sys.stdout.flush()
 			sys.stderr.flush()
 			os.dup2(saved[0], 1)
@@ -1225,6 +1275,7 @@ def main() -> None:
 		output = clip(raw, out_path)
 		cell_stats = stats.take()
 		cell_stats['cut'] = len(raw) > MAX_OUTPUT_CHARS
+		cell_stats['tabs'] = tabman.metrics()  # tab/crash/download/popup-limit/fallback/memory numbers (repl/tabs.py)
 		send(
 			{
 				'type': 'result',
